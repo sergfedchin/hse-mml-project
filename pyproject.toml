@@ -1,0 +1,19 @@
+[project]
+name = "hse-mml-project"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "chromadb>=1.3.4",
+    "fastapi>=0.121.1",
+    "ipywidgets>=8.1.8",
+    "jupyter>=1.1.1",
+    "langchain>=1.0.4",
+    "langchain-text-splitters>=1.0.0",
+    "pandoc>=2.4",
+    "pypandoc>=1.15",
+    "toml>=0.10.2",
+    "tqdm>=4.67.1",
+    "unstructured>=0.18.18",
+]
