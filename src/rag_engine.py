@@ -1,4 +1,6 @@
-""" Мультимодальный RAG Engine v3.0 с поддержкой удаления документов """
+"""
+Мультимодальный RAG Engine v3.0 с гибридным поиском для изображений
+"""
 
 import asyncio
 import base64
@@ -33,8 +35,6 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 # Pydantic Schema для Structured Output
 # ============================================================================
-
-
 class ImageAnalysisResult(BaseModel):
     """Структура ответа VLM для анализа изображения."""
 
@@ -49,7 +49,6 @@ class ImageAnalysisResult(BaseModel):
 # ============================================================================
 # Промпт (объединенный)
 # ============================================================================
-
 UNIFIED_VLM_PROMPT = """Проанализируй этот скриншот и верни JSON с двумя полями:
 
 1. "ocr_text": Извлеки ВЕСЬ видимый текст на изображении точно как он написан, построчно. Если текста нет, оставь пустую строку.
@@ -63,7 +62,6 @@ UNIFIED_VLM_PROMPT = """Проанализируй этот скриншот и 
    - Значки, индикаторы, элементы статуса
 
 Сосредоточься на функциональных аспектах. Отвечай строго на русском языке БЕЗ markdown форматирования.
-
 Верни строго валидный JSON без дополнительных пояснений.
 """
 
@@ -71,8 +69,6 @@ UNIFIED_VLM_PROMPT = """Проанализируй этот скриншот и 
 # ============================================================================
 # Dataclasses
 # ============================================================================
-
-
 @dataclass
 class MultimodalChunk:
     """Унифицированный класс для результатов поиска."""
@@ -98,23 +94,9 @@ class MultimodalChunk:
         return {k: v for k, v in asdict(self).items() if v is not None}
 
 
-@dataclass
-class HybridSearchConfig:
-    """Конфигурация гибридного поиска."""
-
-    weight_semantic: float = 0.7
-    weight_lexical: float = 0.3
-    top_k_retrieve: int = 100
-    top_k_rerank: int = 50
-    final_k: int = 10
-    rrf_k: int = 60
-
-
 # ============================================================================
 # RAG Engine
 # ============================================================================
-
-
 class RAGEngine:
     def __init__(self, config: Config):
         self.config = config
@@ -132,12 +114,18 @@ class RAGEngine:
         self._bm25_text = None
         self._bm25_text_corpus = []
         self._bm25_text_ids = []
+
         self._bm25_tables = None
         self._bm25_tables_corpus = []
         self._bm25_tables_ids = []
 
+        # BM25 для изображений (новое)
+        self._bm25_images = None
+        self._bm25_images_corpus = []
+        self._bm25_images_ids = []
+
         self.documents_metadata = {}
-        self.hybrid_config = HybridSearchConfig()
+        self.hybrid_config = config.hybrid_search
 
         logger.info("Multimodal RAG Engine v3.0 initialized")
 
@@ -157,9 +145,11 @@ class RAGEngine:
                 name="text_chunks",
                 metadata={"description": "Text content with embeddings"},
             )
+
             self.image_collection = self.chroma_client.get_or_create_collection(
                 name="images", metadata={"description": "Images with visual embeddings"}
             )
+
             self.table_collection = self.chroma_client.get_or_create_collection(
                 name="tables", metadata={"description": "Tables with TAG structure"}
             )
@@ -169,9 +159,7 @@ class RAGEngine:
             # Ollama client
             self.ollama_client = ollama.Client(
                 self.config.ollama_base_url,
-                timeout=httpx.Timeout(
-                    connect=10.0, read=300.0, write=10.0, pool=10.0
-                ),
+                timeout=httpx.Timeout(connect=10.0, read=300.0, write=10.0, pool=10.0),
             )
 
             # Проверка подключения
@@ -229,6 +217,22 @@ class RAGEngine:
                     f"BM25 table index initialized with {len(self._bm25_tables_ids)} tables"
                 )
 
+            # Изображения (новое)
+            image_results = self.image_collection.get()
+            if image_results["ids"]:
+                self._bm25_images_ids = image_results["ids"]
+                self._bm25_images_corpus = []
+                for meta in image_results["metadatas"]:
+                    # Комбинируем alt_text и ocr_text для BM25
+                    text = (
+                        f"{meta.get('alt_text', '')} {meta.get('ocr_text', '')}".lower()
+                    )
+                    self._bm25_images_corpus.append(text.split())
+                self._bm25_images = BM25Okapi(self._bm25_images_corpus)
+                logger.info(
+                    f"BM25 image index initialized with {len(self._bm25_images_ids)} images"
+                )
+
         except Exception as e:
             logger.warning(f"Could not initialize BM25 indices: {e}")
 
@@ -236,6 +240,7 @@ class RAGEngine:
         """Очистка ресурсов."""
         self._bm25_text = None
         self._bm25_tables = None
+        self._bm25_images = None
         gc.collect()
         logger.info("RAG Engine cleaned up")
 
@@ -252,9 +257,34 @@ class RAGEngine:
         )
 
     # ========================================================================
+    # НОРМАЛИЗАЦИЯ СКОРОВ (новое)
+    # ========================================================================
+    def _normalize_scores_minmax(
+        self, chunks: List[MultimodalChunk]
+    ) -> List[MultimodalChunk]:
+        """Нормализует скоры в диапазон [0, 1] используя min-max нормализацию."""
+        if not chunks:
+            return chunks
+
+        scores = [c.score for c in chunks]
+        min_score = min(scores)
+        max_score = max(scores)
+
+        # Избегаем деления на ноль
+        if max_score - min_score < 1e-9:
+            for chunk in chunks:
+                chunk.score = 1.0 if chunk.score > 0 else 0.001
+            return chunks
+
+        # Min-max нормализация: (x - min) / (max - min)
+        for chunk in chunks:
+            chunk.score = (chunk.score - min_score) / (max_score - min_score)
+
+        return chunks
+
+    # ========================================================================
     # ДОБАВЛЕНИЕ ДОКУМЕНТА
     # ========================================================================
-
     async def add_document(
         self, rst_content: str, document_url: str, images_base_path: str
     ) -> str:
@@ -314,23 +344,9 @@ class RAGEngine:
     # ========================================================================
     # УДАЛЕНИЕ ДОКУМЕНТА
     # ========================================================================
-
     async def delete_document(self, file_id: str) -> bool:
         """
         Полное удаление документа из системы.
-        
-        Удаляет:
-        - Все текстовые чанки из векторной БД и BM25
-        - Все таблицы из векторной БД и BM25
-        - Все изображения из векторной БД
-        - Все файлы изображений из storage
-        - Метаданные документа
-        
-        Args:
-            file_id: Идентификатор документа для удаления
-            
-        Returns:
-            bool: True если документ успешно удален, False если документ не найден
         """
         if file_id not in self.documents_metadata:
             logger.warning(f"Document {file_id} not found in metadata")
@@ -345,7 +361,7 @@ class RAGEngine:
             # 2. Удаление таблиц из ChromaDB и BM25
             await self._delete_tables(file_id)
 
-            # 3. Удаление изображений (файлы + ChromaDB)
+            # 3. Удаление изображений (файлы + ChromaDB + BM25)
             await self._delete_images(file_id)
 
             # 4. Удаление метаданных документа
@@ -361,9 +377,7 @@ class RAGEngine:
     async def _delete_text_chunks(self, file_id: str):
         """Удаление текстовых чанков документа из ChromaDB и BM25."""
         try:
-            # Получить все ID чанков документа
             results = self.text_collection.get(where={"file_id": file_id})
-
             if not results["ids"]:
                 logger.debug(f"No text chunks found for document {file_id}")
                 return
@@ -376,10 +390,8 @@ class RAGEngine:
 
             # Удалить из BM25 индекса
             if self._bm25_text:
-                # Создаем новые списки без удаляемых чанков
                 new_ids = []
                 new_corpus = []
-
                 for idx, doc_id in enumerate(self._bm25_text_ids):
                     if doc_id not in chunk_ids:
                         new_ids.append(doc_id)
@@ -388,7 +400,6 @@ class RAGEngine:
                 self._bm25_text_ids = new_ids
                 self._bm25_text_corpus = new_corpus
 
-                # Пересоздаем BM25 индекс
                 if self._bm25_text_corpus:
                     self._bm25_text = BM25Okapi(self._bm25_text_corpus)
                 else:
@@ -403,9 +414,7 @@ class RAGEngine:
     async def _delete_tables(self, file_id: str):
         """Удаление таблиц документа из ChromaDB и BM25."""
         try:
-            # Получить все ID таблиц документа
             results = self.table_collection.get(where={"file_id": file_id})
-
             if not results["ids"]:
                 logger.debug(f"No tables found for document {file_id}")
                 return
@@ -418,10 +427,8 @@ class RAGEngine:
 
             # Удалить из BM25 индекса
             if self._bm25_tables:
-                # Создаем новые списки без удаляемых таблиц
                 new_ids = []
                 new_corpus = []
-
                 for idx, table_id in enumerate(self._bm25_tables_ids):
                     if table_id not in table_ids:
                         new_ids.append(table_id)
@@ -430,7 +437,6 @@ class RAGEngine:
                 self._bm25_tables_ids = new_ids
                 self._bm25_tables_corpus = new_corpus
 
-                # Пересоздаем BM25 индекс
                 if self._bm25_tables_corpus:
                     self._bm25_tables = BM25Okapi(self._bm25_tables_corpus)
                 else:
@@ -443,18 +449,15 @@ class RAGEngine:
             raise
 
     async def _delete_images(self, file_id: str):
-        """Удаление изображений документа: файлы из storage и записи из ChromaDB."""
+        """Удаление изображений документа: файлы из storage, записи из ChromaDB и BM25."""
         try:
-            # Получить все изображения документа
             results = self.image_collection.get(where={"file_id": file_id})
-
             if not results["ids"]:
                 logger.debug(f"No images found for document {file_id}")
                 return
 
             image_ids = results["ids"]
             metadatas = results["metadatas"]
-
             logger.info(f"Deleting {len(image_ids)} images for document {file_id}")
 
             # Удалить файлы изображений из storage
@@ -475,8 +478,26 @@ class RAGEngine:
 
             # Удалить из ChromaDB
             self.image_collection.delete(ids=image_ids)
-
             logger.debug(f"Removed {len(image_ids)} images from ChromaDB")
+
+            # Удалить из BM25 индекса (новое)
+            if self._bm25_images:
+                new_ids = []
+                new_corpus = []
+                for idx, image_id in enumerate(self._bm25_images_ids):
+                    if image_id not in image_ids:
+                        new_ids.append(image_id)
+                        new_corpus.append(self._bm25_images_corpus[idx])
+
+                self._bm25_images_ids = new_ids
+                self._bm25_images_corpus = new_corpus
+
+                if self._bm25_images_corpus:
+                    self._bm25_images = BM25Okapi(self._bm25_images_corpus)
+                else:
+                    self._bm25_images = None
+
+                logger.debug(f"Removed {len(image_ids)} images from BM25 image index")
 
         except Exception as e:
             logger.error(f"Error deleting images for {file_id}: {e}")
@@ -485,7 +506,6 @@ class RAGEngine:
     # ========================================================================
     # КОНВЕРТАЦИЯ RST
     # ========================================================================
-
     async def _rst_to_markdown(self, rst_content: str) -> str:
         """Конвертация RST в Markdown."""
         try:
@@ -500,7 +520,6 @@ class RAGEngine:
     # ========================================================================
     # ОБРАБОТКА ИЗОБРАЖЕНИЙ (VLM + Structured Output)
     # ========================================================================
-
     async def _extract_and_process_images(
         self, markdown_content: str, images_base_path: str, file_id: str
     ) -> List[Dict[str, Any]]:
@@ -554,8 +573,8 @@ class RAGEngine:
             return {
                 "image_id": image_id,
                 "image_path": str(storage_path),
-                "alt_text": alt_text,
-                "ocr_text": analysis_result.ocr_text,
+                "alttext": alt_text,
+                "ocrtext": analysis_result.ocr_text,
                 "vlm_description": analysis_result.ui_description,
                 "original_path": image_path,
             }
@@ -574,7 +593,6 @@ class RAGEngine:
 
             # Гарантировать минимальный размер 32x32 для vision-моделей
             if image.width < 32 or image.height < 32:
-                # Увеличиваем до 32x32 с сохранением пропорций
                 scale = 32.0 / min(image.width, image.height)
                 new_size = (int(image.width * scale), int(image.height * scale))
                 image = image.resize(new_size, PILImage.Resampling.LANCZOS)
@@ -625,7 +643,6 @@ class RAGEngine:
     # ========================================================================
     # ОБРАБОТКА ТАБЛИЦ (TAG)
     # ========================================================================
-
     async def _extract_and_process_tables(
         self, markdown_content: str, file_id: str
     ) -> Tuple[str, List[Dict[str, Any]]]:
@@ -635,465 +652,380 @@ class RAGEngine:
 
         # Паттерны для таблиц
         grid_table_pattern = r"(\n\+[-+]+\+\n(?:\|[^\n]*\|\n)+\+[-+]+\+)"
-        pipe_table_pattern = (
-            r"(\n\|[^\n]+\|\n\|[-\s|:]+\|\n(?:\|[^\n]+\|\n)+)"
-        )
+        pipe_table_pattern = r"(\n\|[^\n]+\|\n\|[-\s|:]+\|\n(?:\|[^\n]+\|\n)+)"
         html_table_pattern = r"(<table[^>]*>.*?</table>)"
 
-        all_patterns = [
-            ("grid", grid_table_pattern),
-            ("pipe", pipe_table_pattern),
-            ("html", html_table_pattern),
-        ]
+        all_tables = []
 
-        for table_type, pattern in all_patterns:
-            matches = re.finditer(
-                pattern, markdown_content, re.DOTALL | re.IGNORECASE
-            )
+        # Grid tables
+        for match in re.finditer(grid_table_pattern, content_without_tables, re.DOTALL):
+            all_tables.append(("grid", match.group(1), match.start()))
 
-            for idx, match in enumerate(matches):
-                table_text = match.group(0)
-                table_id = f"{file_id}_table_{len(tables_info)}"
+        # Pipe tables
+        for match in re.finditer(pipe_table_pattern, content_without_tables):
+            all_tables.append(("pipe", match.group(1), match.start()))
 
-                try:
-                    if table_type == "html":
-                        table_data = self._parse_html_table(table_text)
-                    else:
-                        table_data = self._parse_markdown_table(table_text)
+        # HTML tables
+        for match in re.finditer(html_table_pattern, content_without_tables, re.DOTALL):
+            all_tables.append(("html", match.group(1), match.start()))
 
-                    if table_data:
-                        tables_info.append(
-                            {
-                                "table_id": table_id,
-                                "table_type": table_type,
-                                "content": table_data,
-                                "raw_text": table_text,
-                            }
-                        )
+        # Сортировка по позиции
+        all_tables.sort(key=lambda x: x[2])
 
-                        # Заменяем таблицу на placeholder
-                        placeholder = f"[TABLE_{len(tables_info) - 1}]"
-                        content_without_tables = content_without_tables.replace(
-                            table_text, placeholder, 1
-                        )
+        for idx, (table_type, raw_table, _) in enumerate(all_tables):
+            try:
+                # Извлечение контекста
+                context_before, context_after = self._extract_table_context(
+                    content_without_tables, raw_table
+                )
 
-                except Exception as e:
-                    logger.warning(f"Failed to parse table: {e}")
+                # Парсинг таблицы
+                if table_type == "grid":
+                    parsed = self._parse_grid_table(raw_table)
+                elif table_type == "pipe":
+                    parsed = self._parse_pipe_table(raw_table)
+                else:  # html
+                    parsed = self._parse_html_table(raw_table)
+
+                if not parsed:
+                    continue
+
+                table_id = f"{file_id}_table_{idx}"
+
+                table_info = {
+                    "table_id": table_id,
+                    "type": table_type,
+                    "raw_text": raw_table,
+                    "structured_content": parsed,
+                    "context_before": context_before,
+                    "context_after": context_after,
+                    "headers": list(parsed[0].keys()) if parsed else [],
+                    "num_rows": len(parsed),
+                    "num_cols": len(parsed[0]) if parsed else 0,
+                }
+
+                tables_info.append(table_info)
+
+                # Удаляем таблицу из контента
+                content_without_tables = content_without_tables.replace(
+                    raw_table, f"\n[TABLE_{idx}]\n", 1
+                )
+
+            except Exception as e:
+                logger.warning(f"Failed to parse table {idx}: {e}")
+                continue
 
         return content_without_tables, tables_info
 
-    def _parse_markdown_table(self, table_text: str) -> Optional[List[Dict[str, Any]]]:
-        """Парсинг Markdown таблицы."""
-        try:
-            lines = [line.strip() for line in table_text.split("\n") if line.strip()]
+    def _extract_table_context(
+        self, content: str, table_text: str, context_chars: int = 200
+    ) -> Tuple[str, str]:
+        """Извлечение контекста вокруг таблицы."""
+        table_pos = content.find(table_text)
+        if table_pos == -1:
+            return "", ""
 
-            header_line = None
-            data_lines = []
+        start = max(0, table_pos - context_chars)
+        end = min(len(content), table_pos + len(table_text) + context_chars)
 
-            for line in lines:
-                if "|" in line and not line.strip().startswith("+"):
-                    if "---" in line or ":-" in line:
-                        continue
-                    if header_line is None:
-                        header_line = line
-                    else:
-                        data_lines.append(line)
+        context_before = content[start:table_pos].strip()
+        context_after = content[table_pos + len(table_text) : end].strip()
 
-            if not header_line:
-                return None
+        return context_before, context_after
 
-            headers = [h.strip() for h in header_line.split("|") if h.strip()]
-            rows = []
+    def _parse_grid_table(self, table_text: str) -> List[Dict[str, str]]:
+        """Парсинг Grid таблиц."""
+        lines = [
+            line
+            for line in table_text.split("\n")
+            if line.strip() and not line.startswith("+")
+        ]
+        if not lines:
+            return []
 
-            for line in data_lines:
-                cells = [c.strip() for c in line.split("|") if c.strip()]
-                if len(cells) == len(headers):
-                    row = {headers[i]: cells[i] for i in range(len(headers))}
-                    rows.append(row)
+        headers = [cell.strip() for cell in lines[0].split("|")[1:-1]]
+        rows = []
 
-            return rows if rows else None
+        for line in lines[1:]:
+            cells = [cell.strip() for cell in line.split("|")[1:-1]]
+            if len(cells) == len(headers):
+                rows.append(dict(zip(headers, cells)))
 
-        except Exception as e:
-            logger.debug(f"Markdown table parsing error: {e}")
-            return None
+        return rows
 
-    def _parse_html_table(self, table_html: str) -> Optional[List[Dict[str, Any]]]:
-        """Парсинг HTML таблицы."""
-        try:
-            soup = BeautifulSoup(table_html, "html.parser")
-            table = soup.find("table")
+    def _parse_pipe_table(self, table_text: str) -> List[Dict[str, str]]:
+        """Парсинг Pipe таблиц."""
+        lines = [line.strip() for line in table_text.split("\n") if line.strip()]
+        if len(lines) < 2:
+            return []
 
-            if not table:
-                return None
+        headers = [cell.strip() for cell in lines[0].split("|")[1:-1]]
+        rows = []
 
-            # Извлечение заголовков
-            headers = []
-            thead = table.find("thead")
-            if thead:
-                header_row = thead.find("tr")
-                if header_row:
-                    headers = [
-                        th.get_text(strip=True) for th in header_row.find_all(["th", "td"])
-                    ]
+        for line in lines[2:]:  # Пропускаем separator
+            cells = [cell.strip() for cell in line.split("|")[1:-1]]
+            if len(cells) == len(headers):
+                rows.append(dict(zip(headers, cells)))
 
-            if not headers:
-                first_row = table.find("tr")
+        return rows
+
+    def _parse_html_table(self, table_html: str) -> List[Dict[str, str]]:
+        """Парсинг HTML таблиц."""
+        soup = BeautifulSoup(table_html, "html.parser")
+        table = soup.find("table")
+
+        if not table:
+            return []
+
+        headers = []
+        thead = table.find("thead")
+        if thead:
+            header_row = thead.find("tr")
+            if header_row:
+                headers = [
+                    th.get_text(strip=True) for th in header_row.find_all(["th", "td"])
+                ]
+
+        # Если заголовков нет в thead, берем из первой строки tbody
+        if not headers:
+            tbody = table.find("tbody")
+            if tbody:
+                first_row = tbody.find("tr")
                 if first_row:
                     headers = [
                         cell.get_text(strip=True)
                         for cell in first_row.find_all(["th", "td"])
                     ]
 
-            # Извлечение данных
-            rows = []
-            tbody = table.find("tbody") or table
+        if not headers:
+            return []
 
-            for row in tbody.find_all("tr")[1 if not thead else 0:]:
+        rows = []
+        tbody = table.find("tbody")
+        if tbody:
+            for row in tbody.find_all("tr"):
                 cells = [
                     cell.get_text(strip=True) for cell in row.find_all(["td", "th"])
                 ]
                 if len(cells) == len(headers):
-                    row_dict = {headers[i]: cells[i] for i in range(len(headers))}
-                    rows.append(row_dict)
+                    rows.append(dict(zip(headers, cells)))
 
-            return rows if rows else None
-
-        except Exception as e:
-            logger.debug(f"HTML table parsing error: {e}")
-            return None
+        return rows
 
     # ========================================================================
     # РАЗБИЕНИЕ ТЕКСТА
     # ========================================================================
-
     async def _split_text_with_context(
         self, markdown_content: str, file_id: str, document_url: str
     ) -> List[Dict[str, Any]]:
         """Разбиение текста на чанки с контекстом."""
-        try:
-            splitter = MarkdownTextSplitter(
-                chunk_size=self.config.chunk_size,
-                chunk_overlap=self.config.chunk_overlap,
+        splitter = MarkdownTextSplitter(
+            chunk_size=self.config.chunk_size,
+            chunk_overlap=self.config.chunk_overlap,
+        )
+
+        chunks = splitter.split_text(markdown_content)
+        chunks_with_metadata = []
+
+        for idx, chunk in enumerate(chunks):
+            # Извлечение заголовка секции
+            section_header = ""
+            lines = chunk.split("\n")
+            for line in lines:
+                if line.startswith("#"):
+                    section_header = line.lstrip("#").strip()
+                    break
+
+            chunk_id = f"{file_id}_chunk_{idx}"
+            chunks_with_metadata.append(
+                {
+                    "chunk_id": chunk_id,
+                    "content": chunk,
+                    "section_header": section_header,
+                    "chunk_index": idx,
+                    "file_id": file_id,
+                    "document_url": document_url,
+                }
             )
 
-            chunks = splitter.split_text(markdown_content)
-
-            result_chunks = []
-            current_header = ""
-
-            for idx, chunk in enumerate(chunks):
-                # Поиск заголовка в чанке
-                header_match = re.search(r"^#{1,6}\s+(.+)", chunk, re.MULTILINE)
-                if header_match:
-                    current_header = header_match.group(1).strip()
-
-                chunk_id = f"{file_id}_chunk_{idx}"
-                result_chunks.append(
-                    {
-                        "chunk_id": chunk_id,
-                        "content": chunk,
-                        "section_header": current_header,
-                        "chunk_index": idx,
-                        "file_id": file_id,
-                        "document_url": document_url,
-                    }
-                )
-
-            return result_chunks
-
-        except Exception as e:
-            logger.error(f"Text splitting error: {e}")
-            return []
+        return chunks_with_metadata
 
     # ========================================================================
-    # ИНДЕКСИРОВАНИЕ
+    # ЭМБЕДДИНГИ И ИНДЕКСАЦИЯ
     # ========================================================================
+    async def get_text_embeddings(self, texts: List[str]) -> List[List[float]]:
+        """Генерация эмбеддингов для текстов."""
+        loop = asyncio.get_event_loop()
+        embeddings = await loop.run_in_executor(
+            None,
+            lambda: self.ollama_client.embed(
+                model=self.config.text_embedding_model, input=texts, keep_alive="10s"
+            ).embeddings,
+        )
+        return embeddings
 
     async def _embed_and_store_text_chunks(self, chunks: List[Dict[str, Any]]):
-        """Сохранение текстовых чанков в ChromaDB."""
+        """Индексация текстовых чанков."""
         if not chunks:
             return
 
-        try:
-            chunk_ids = [c["chunk_id"] for c in chunks]
-            documents = [c["content"] for c in chunks]
-            metadatas = [
+        texts = [chunk["content"] for chunk in chunks]
+        embeddings = await self.get_text_embeddings(texts)
+
+        self.text_collection.add(
+            ids=[chunk["chunk_id"] for chunk in chunks],
+            embeddings=embeddings,
+            documents=texts,
+            metadatas=[
                 {
-                    "file_id": c["file_id"],
-                    "document_url": c["document_url"],
-                    "section_header": c["section_header"],
-                    "chunk_index": c["chunk_index"],
+                    "file_id": chunk["file_id"],
+                    "document_url": chunk["document_url"],
+                    "section_header": chunk["section_header"],
+                    "chunk_index": chunk["chunk_index"],
                 }
-                for c in chunks
-            ]
+                for chunk in chunks
+            ],
+        )
 
-            # Получение эмбеддингов
-            embeddings = await self._get_text_embeddings(documents)
-
-            # Сохранение в ChromaDB
-            self.text_collection.add(
-                ids=chunk_ids,
-                embeddings=embeddings,
-                documents=documents,
-                metadatas=metadatas,
-            )
-
-        except Exception as e:
-            logger.error(f"Error storing text chunks: {e}")
-            raise
+        logger.info(f"Stored {len(chunks)} text chunks in vector DB")
 
     async def _embed_and_store_images(
         self, images_info: List[Dict[str, Any]], file_id: str, document_url: str
     ):
-        """Сохранение изображений в ChromaDB."""
+        """Индексация изображений с обновлением BM25."""
         if not images_info:
             return
 
-        try:
-            for img_info in images_info:
-                # Создание текстового представления для эмбеддинга
-                text_repr = (
-                    f"{img_info['alt_text']} {img_info['ocr_text']} {img_info['vlm_description']}"
-                )
+        # Комбинированный текст для эмбеддингов
+        combined_texts = []
+        for img_info in images_info:
+            text = f"{img_info['alttext']} {img_info['ocrtext']} {img_info['vlm_description']}"
+            combined_texts.append(text)
 
-                # Получение эмбеддинга
-                embedding = await self._get_text_embeddings([text_repr])
+        embeddings = await self.get_text_embeddings(combined_texts)
 
-                # Сохранение в ChromaDB
-                self.image_collection.add(
-                    ids=[img_info["image_id"]],
-                    embeddings=embedding,
-                    documents=[text_repr],
-                    metadatas=[
-                        {
-                            "file_id": file_id,
-                            "document_url": document_url,
-                            "image_path": img_info["image_path"],
-                            "alt_text": img_info["alt_text"],
-                            "ocr_text": img_info["ocr_text"],
-                            "vlm_description": img_info["vlm_description"],
-                        }
-                    ],
-                )
+        self.image_collection.add(
+            ids=[img_info["image_id"] for img_info in images_info],
+            embeddings=embeddings,
+            documents=combined_texts,
+            metadatas=[
+                {
+                    "file_id": file_id,
+                    "document_url": document_url,
+                    "image_path": img_info["image_path"],
+                    "alt_text": img_info["alttext"],
+                    "ocr_text": img_info["ocrtext"],
+                    "vlm_description": img_info["vlm_description"],
+                }
+                for img_info in images_info
+            ],
+        )
 
-        except Exception as e:
-            logger.error(f"Error storing images: {e}")
-            raise
+        # Обновление BM25 для изображений (новое)
+        for img_info in images_info:
+            self._bm25_images_ids.append(img_info["image_id"])
+            text_for_bm25 = f"{img_info['alttext']} {img_info['ocrtext']}".lower()
+            self._bm25_images_corpus.append(text_for_bm25.split())
+
+        if self._bm25_images_corpus:
+            self._bm25_images = BM25Okapi(self._bm25_images_corpus)
+
+        logger.info(f"Stored {len(images_info)} images in vector DB and BM25")
 
     async def _embed_and_store_tables(
         self, tables_info: List[Dict[str, Any]], file_id: str, document_url: str
     ):
-        """Сохранение таблиц в ChromaDB."""
+        """Индексация таблиц."""
         if not tables_info:
             return
 
-        try:
-            for table_info in tables_info:
-                # Создание текстового представления (TAG)
-                table_text = json.dumps(table_info["content"], ensure_ascii=False)
+        # Формируем текстовое представление таблиц
+        table_texts = []
+        for table in tables_info:
+            # Комбинируем контекст и содержимое
+            rows_text = " ".join(
+                [
+                    " ".join([f"{k}: {v}" for k, v in row.items()])
+                    for row in table["structured_content"]
+                ]
+            )
+            full_text = (
+                f"{table['context_before']} {rows_text} {table['context_after']}"
+            )
+            table_texts.append(full_text)
 
-                # Получение эмбеддинга
-                embedding = await self._get_text_embeddings([table_text])
+        embeddings = await self.get_text_embeddings(table_texts)
 
-                # Сохранение в ChromaDB
-                self.table_collection.add(
-                    ids=[table_info["table_id"]],
-                    embeddings=embedding,
-                    documents=[table_text],
-                    metadatas=[
-                        {
-                            "file_id": file_id,
-                            "document_url": document_url,
-                            "table_type": table_info["table_type"],
-                            "raw_text": table_info["raw_text"],
-                        }
-                    ],
-                )
+        self.table_collection.add(
+            ids=[table["table_id"] for table in tables_info],
+            embeddings=embeddings,
+            documents=table_texts,
+            metadatas=[
+                {
+                    "file_id": file_id,
+                    "document_url": document_url,
+                    "type": table["type"],
+                    "raw_text": table["raw_text"],
+                    "context": f"{table['context_before']} {table['context_after']}",
+                    "summary": " ".join(table["headers"]),
+                    "num_rows": table["num_rows"],
+                    "num_cols": table["num_cols"],
+                }
+                for table in tables_info
+            ],
+        )
 
-        except Exception as e:
-            logger.error(f"Error storing tables: {e}")
-            raise
-
-    # ========================================================================
-    # ОБНОВЛЕНИЕ BM25
-    # ========================================================================
+        logger.info(f"Stored {len(tables_info)} tables in vector DB")
 
     async def _update_bm25_indices(
-        self, text_chunks: List[Dict[str, Any]], tables_info: List[Dict[str, Any]]
+        self,
+        text_chunks: List[Dict[str, Any]],
+        tables_info: List[Dict[str, Any]],
     ):
         """Обновление BM25 индексов."""
-        try:
-            # Текстовые чанки
-            if text_chunks:
-                for chunk in text_chunks:
-                    self._bm25_text_ids.append(chunk["chunk_id"])
-                    self._bm25_text_corpus.append(chunk["content"].lower().split())
+        # Текстовые чанки
+        for chunk in text_chunks:
+            self._bm25_text_ids.append(chunk["chunk_id"])
+            self._bm25_text_corpus.append(chunk["content"].lower().split())
 
-                self._bm25_text = BM25Okapi(self._bm25_text_corpus)
+        if self._bm25_text_corpus:
+            self._bm25_text = BM25Okapi(self._bm25_text_corpus)
 
-            # Таблицы
-            if tables_info:
-                for table in tables_info:
-                    self._bm25_tables_ids.append(table["table_id"])
-                    table_text = json.dumps(
-                        table["content"], ensure_ascii=False
-                    ).lower()
-                    self._bm25_tables_corpus.append(table_text.split())
+        # Таблицы
+        for table in tables_info:
+            self._bm25_tables_ids.append(table["table_id"])
+            context = f"{table['context_before']} {table['context_after']}"
+            self._bm25_tables_corpus.append(context.lower().split())
 
-                self._bm25_tables = BM25Okapi(self._bm25_tables_corpus)
+        if self._bm25_tables_corpus:
+            self._bm25_tables = BM25Okapi(self._bm25_tables_corpus)
 
-        except Exception as e:
-            logger.warning(f"BM25 update error: {e}")
+        logger.info("BM25 indices updated")
 
     # ========================================================================
-    # ОТКАТ (ROLLBACK)
+    # ПОИСК
     # ========================================================================
-
-    async def _rollback_document(self, file_id: str):
-        """Откат при ошибке добавления документа."""
+    async def search_text(self, query: str, top_k: int) -> List[MultimodalChunk]:
+        """Гибридный поиск по текстовым чанкам."""
         try:
-            logger.info(f"Rolling back document {file_id}")
-            
-            # Удаляем из всех коллекций
-            for collection in [
-                self.text_collection,
-                self.image_collection,
-                self.table_collection,
-            ]:
-                try:
-                    results = collection.get(where={"file_id": file_id})
-                    if results["ids"]:
-                        collection.delete(ids=results["ids"])
-                except Exception:
-                    pass
-
-            # Удаляем файлы изображений
-            try:
-                results = self.image_collection.get(where={"file_id": file_id})
-                for metadata in results.get("metadatas", []):
-                    image_path = metadata.get("image_path")
-                    if image_path:
-                        try:
-                            Path(image_path).unlink(missing_ok=True)
-                        except Exception:
-                            pass
-            except Exception:
-                pass
-
-            # Удаляем метаданные
-            if file_id in self.documents_metadata:
-                del self.documents_metadata[file_id]
-
-            logger.info(f"Rolled back document {file_id}")
-
-        except Exception as e:
-            logger.error(f"Rollback error: {e}")
-
-    # ========================================================================
-    # ЭМБЕДДИНГИ
-    # ========================================================================
-
-    async def _get_text_embeddings(self, texts: List[str]) -> List[List[float]]:
-        """Получение эмбеддингов через Ollama."""
-        try:
-            loop = asyncio.get_event_loop()
-            embeddings = await loop.run_in_executor(
-                None, self._get_embeddings_sync, texts
-            )
-            return embeddings
-        except Exception as e:
-            logger.error(f"Error generating embeddings: {e}")
-            raise
-
-    def _get_embeddings_sync(self, texts: List[str]) -> List[List[float]]:
-        """Синхронное получение эмбеддингов."""
-        try:
-            response: ollama.EmbedResponse = self.ollama_client.embed(
-                model=self.config.text_embedding_model,
-                input=texts,
-                keep_alive="10s",
+            # Векторный поиск
+            query_embedding = await self.get_text_embeddings([query])
+            vector_results = self.text_collection.query(
+                query_embeddings=query_embedding,
+                n_results=min(
+                    top_k * 2,
+                    max(1, len(self._bm25_text_ids) if self._bm25_text_ids else top_k),
+                ),
             )
 
-            # Fallback на пустые эмбеддинги
-            if not response.embeddings or len(response.embeddings) != len(texts):
-                return [[0.0] * 768 for _ in texts]
-
-            return response.embeddings
-
-        except Exception as e:
-            logger.warning(f"Embedding failed for text: {e}")
-            return [[0.0] * 768 for _ in texts]
-
-    # ========================================================================
-    # МУЛЬТИМОДАЛЬНЫЙ ПОИСК
-    # ========================================================================
-
-    async def hybrid_search(self, query: str, top_k: int = 10) -> List[MultimodalChunk]:
-        """
-        Мультимодальный гибридный поиск по ВСЕМ модальностям.
-        
-        Выполняет параллельный поиск по:
-        - Текстовым чанкам (BM25 + векторный поиск)
-        - Изображениям (векторный поиск по OCR + VLM описаниям)
-        - Таблицам (BM25 + векторный поиск по TAG структуре)
-        
-        Args:
-            query: Поисковый запрос
-            top_k: Количество лучших результатов для возврата
-            
-        Returns:
-            List[MultimodalChunk]: Отсортированный список результатов из всех модальностей
-        """
-        try:
-            # Параллельный поиск по всем коллекциям
-            text_results_task = self._search_text_chunks(query, top_k * 2)
-            image_results_task = self._search_images(query, top_k * 2)
-            table_results_task = self._search_tables(query, top_k * 2)
-
-            text_results, image_results, table_results = await asyncio.gather(
-                text_results_task, image_results_task, table_results_task
-            )
-
-            # Объединение и сортировка результатов по score
-            all_results = text_results + image_results + table_results
-            all_results.sort(key=lambda x: x.score, reverse=True)
-
-            logger.info(
-                f"Multimodal search completed: {len(text_results)} text, "
-                f"{len(image_results)} images, {len(table_results)} tables"
-            )
-
-            return all_results[:top_k]
-
-        except Exception as e:
-            logger.error(f"Hybrid search error: {e}", exc_info=True)
-            return []
-
-    async def _search_text_chunks(
-        self, query: str, top_k: int
-    ) -> List[MultimodalChunk]:
-        """Поиск по текстовым чанкам (гибридный BM25 + векторный)."""
-        try:
             # BM25 поиск
             bm25_scores = []
             if self._bm25_text:
                 query_tokens = query.lower().split()
                 bm25_scores = self._bm25_text.get_scores(query_tokens)
 
-            # Векторный поиск
-            query_embedding = await self._get_text_embeddings([query])
-
-            vector_results = self.text_collection.query(
-                query_embeddings=query_embedding,
-                n_results=min(
-                    top_k * 2,
-                    max(1, len(self._bm25_text_ids)) if self._bm25_text_ids else top_k,
-                ),
-            )
-
-            # Объединение результатов (RRF)
+            # Комбинированные результаты
             results = []
-
             for idx, (doc_id, doc, metadata, distance) in enumerate(
                 zip(
                     vector_results["ids"][0],
@@ -1102,7 +1034,6 @@ class RAGEngine:
                     vector_results["distances"][0],
                 )
             ):
-                # Векторный скор (косинусное сходство)
                 vector_score = 1 / (1 + distance)
 
                 # BM25 скор
@@ -1112,10 +1043,11 @@ class RAGEngine:
                     if bm25_idx < len(bm25_scores):
                         bm25_score = bm25_scores[bm25_idx]
 
-                # Гибридная оценка
+                # Гибридный скор
                 hybrid_score = (
                     self.hybrid_config.weight_semantic * vector_score
-                    + self.hybrid_config.weight_lexical * (1 + bm25_score)
+                    + self.hybrid_config.weight_lexical
+                    * (bm25_score / (1 + bm25_score))
                 )
 
                 chunk = MultimodalChunk(
@@ -1128,39 +1060,67 @@ class RAGEngine:
                     section_header=metadata.get("section_header"),
                     chunk_index=metadata.get("chunk_index"),
                 )
-
                 results.append(chunk)
 
-            # Сортировка по score
             results.sort(key=lambda x: x.score, reverse=True)
             return results[:top_k]
 
         except Exception as e:
-            logger.debug(f"Text collection is empty or error: {e}")
+            logger.error(f"Text search error: {e}")
             return []
 
-    async def _search_images(self, query: str, top_k: int) -> List[MultimodalChunk]:
-        """Поиск по изображениям."""
+    async def search_images(self, query: str, top_k: int) -> List[MultimodalChunk]:
+        """Гибридный поиск по изображениям (новое с BM25)."""
         try:
-            query_embedding = await self._get_text_embeddings([query])
-
-            results = self.image_collection.query(
-                query_embeddings=query_embedding, n_results=top_k
+            # Векторный поиск
+            query_embedding = await self.get_text_embeddings([query])
+            vector_results = self.image_collection.query(
+                query_embeddings=query_embedding,
+                n_results=min(
+                    top_k * 2,
+                    max(
+                        1,
+                        len(self._bm25_images_ids) if self._bm25_images_ids else top_k,
+                    ),
+                ),
             )
 
-            chunks = []
-            for doc_id, doc, metadata, distance in zip(
-                results["ids"][0],
-                results["documents"][0],
-                results["metadatas"][0],
-                results["distances"][0],
+            # BM25 поиск
+            bm25_scores = []
+            if self._bm25_images:
+                query_tokens = query.lower().split()
+                bm25_scores = self._bm25_images.get_scores(query_tokens)
+
+            # Комбинированные результаты
+            results = []
+            for idx, (doc_id, doc, metadata, distance) in enumerate(
+                zip(
+                    vector_results["ids"][0],
+                    vector_results["documents"][0],
+                    vector_results["metadatas"][0],
+                    vector_results["distances"][0],
+                )
             ):
-                score = 1 / (1 + distance)
+                vector_score = 1 / (1 + distance)
+
+                # BM25 скор
+                bm25_score = 0.0
+                if self._bm25_images and doc_id in self._bm25_images_ids:
+                    bm25_idx = self._bm25_images_ids.index(doc_id)
+                    if bm25_idx < len(bm25_scores):
+                        bm25_score = bm25_scores[bm25_idx]
+
+                # Гибридный скор с нормализацией BM25
+                hybrid_score = (
+                    self.hybrid_config.weight_semantic * vector_score
+                    + self.hybrid_config.weight_lexical
+                    * (bm25_score / (1 + bm25_score))
+                )
 
                 chunk = MultimodalChunk(
                     chunk_id=doc_id,
                     type="image",
-                    score=score,
+                    score=hybrid_score,
                     document_url=metadata["document_url"],
                     file_id=metadata["file_id"],
                     image_path=metadata.get("image_path"),
@@ -1168,39 +1128,39 @@ class RAGEngine:
                     ocr_text=metadata.get("ocr_text"),
                     vlm_description=metadata.get("vlm_description"),
                 )
+                results.append(chunk)
 
-                chunks.append(chunk)
-
-            return chunks
+            results.sort(key=lambda x: x.score, reverse=True)
+            return results[:top_k]
 
         except Exception as e:
             logger.debug(f"Image collection is empty or error: {e}")
             return []
 
-    async def _search_tables(self, query: str, top_k: int) -> List[MultimodalChunk]:
-        """Поиск по таблицам (TAG)."""
+    async def search_tables(self, query: str, top_k: int) -> List[MultimodalChunk]:
+        """Гибридный поиск по таблицам."""
         try:
+            # Векторный поиск
+            query_embedding = await self.get_text_embeddings([query])
+            vector_results = self.table_collection.query(
+                query_embeddings=query_embedding,
+                n_results=min(
+                    top_k * 2,
+                    max(
+                        1,
+                        len(self._bm25_tables_ids) if self._bm25_tables_ids else top_k,
+                    ),
+                ),
+            )
+
             # BM25 поиск
             bm25_scores = []
             if self._bm25_tables:
                 query_tokens = query.lower().split()
                 bm25_scores = self._bm25_tables.get_scores(query_tokens)
 
-            # Векторный поиск
-            query_embedding = await self._get_text_embeddings([query])
-
-            vector_results = self.table_collection.query(
-                query_embeddings=query_embedding,
-                n_results=min(
-                    top_k * 2,
-                    max(1, len(self._bm25_tables_ids))
-                    if self._bm25_tables_ids
-                    else top_k,
-                ),
-            )
-
+            # Комбинированные результаты
             results = []
-
             for idx, (doc_id, doc, metadata, distance) in enumerate(
                 zip(
                     vector_results["ids"][0],
@@ -1218,11 +1178,27 @@ class RAGEngine:
                     if bm25_idx < len(bm25_scores):
                         bm25_score = bm25_scores[bm25_idx]
 
-                # Гибридная оценка
+                # Гибридный скор
                 hybrid_score = (
                     self.hybrid_config.weight_semantic * vector_score
-                    + self.hybrid_config.weight_lexical * (1 + bm25_score)
+                    + self.hybrid_config.weight_lexical
+                    * (bm25_score / (1 + bm25_score))
                 )
+
+                # Парсинг structured_content из raw_text
+                raw_text = metadata.get("raw_text", "")
+                table_type = metadata.get("type", "pipe")
+                structured_content = []
+
+                try:
+                    if table_type == "grid":
+                        structured_content = self._parse_grid_table(raw_text)
+                    elif table_type == "pipe":
+                        structured_content = self._parse_pipe_table(raw_text)
+                    elif table_type == "html":
+                        structured_content = self._parse_html_table(raw_text)
+                except Exception:
+                    pass
 
                 chunk = MultimodalChunk(
                     chunk_id=doc_id,
@@ -1230,10 +1206,18 @@ class RAGEngine:
                     score=hybrid_score,
                     document_url=metadata["document_url"],
                     file_id=metadata["file_id"],
-                    content=doc,
-                    table_metadata=metadata,
+                    table_metadata={
+                        "type": table_type,
+                        "num_rows": metadata.get("num_rows", 0),
+                        "num_cols": metadata.get("num_cols", 0),
+                        "context": metadata.get("context", ""),
+                    },
+                    table_structure={
+                        "headers": metadata.get("summary", "").split(),
+                        "raw_text": raw_text,
+                    },
+                    table_content=structured_content,
                 )
-
                 results.append(chunk)
 
             results.sort(key=lambda x: x.score, reverse=True)
@@ -1242,3 +1226,39 @@ class RAGEngine:
         except Exception as e:
             logger.debug(f"Table collection is empty or error: {e}")
             return []
+
+    async def hybrid_search(self, query: str, top_k: int = 10) -> List[MultimodalChunk]:
+        """
+        Унифицированный гибридный поиск по всем модальностям с min-max нормализацией.
+        """
+        # Параллельный поиск по всем источникам
+        text_results, image_results, table_results = await asyncio.gather(
+            self.search_text(query, top_k),
+            self.search_images(query, top_k),
+            self.search_tables(query, top_k),
+        )
+
+        # Объединение результатов
+        all_results = text_results + image_results + table_results
+
+        if not all_results:
+            return []
+
+        # Применение min-max нормализации (новое)
+        all_results = self._normalize_scores_minmax(all_results)
+
+        # Сортировка по нормализованным скорам
+        all_results.sort(key=lambda x: x.score, reverse=True)
+
+        return all_results[:top_k]
+
+    # ========================================================================
+    # ОТКАТ ИЗМЕНЕНИЙ
+    # ========================================================================
+    async def _rollback_document(self, file_id: str):
+        """Откат изменений при ошибке индексации."""
+        try:
+            await self.delete_document(file_id)
+            logger.info(f"Rolled back document {file_id}")
+        except Exception as e:
+            logger.error(f"Rollback failed for {file_id}: {e}")
