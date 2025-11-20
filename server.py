@@ -186,7 +186,7 @@ async def add_file(
                 error="file_addition_error",
                 message=f"Failed to add file: {str(e)}",
                 details={"url": url}
-            ).dict()
+            ).model_dump()
         )
 
 
@@ -207,7 +207,7 @@ async def delete_file(file_id: str):
                     error="file_not_found",
                     message=f"File with ID {file_id} not found",
                     details={"file_id": file_id}
-                ).dict()
+                ).model_dump()
             )
         
         # Удаление через RAG engine
@@ -227,7 +227,7 @@ async def delete_file(file_id: str):
                 error="file_deletion_error",
                 message=f"Failed to delete file: {str(e)}",
                 details={"file_id": file_id}
-            ).dict()
+            ).model_dump()
         )
 
 
@@ -273,7 +273,7 @@ async def query(request: QueryRequest):
                 error="query_error",
                 message=f"Failed to process query: {str(e)}",
                 details={"query": request.text[:100]}
-            ).dict()
+            ).model_dump()
         )
 
 
@@ -325,7 +325,7 @@ async def get_stats():
             detail=ErrorResponse(
                 error="stats_error",
                 message=f"Failed to get statistics: {str(e)}"
-            ).dict()
+            ).model_dump()
         )
 
 

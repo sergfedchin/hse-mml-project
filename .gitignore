@@ -1,6 +1,7 @@
 .*
 __*__
 data/
-
+*.md
+!README.md
 !.gitignore
 !__init__.py
