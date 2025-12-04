@@ -4,4 +4,5 @@ data/
 *.md
 !README.md
 !.gitignore
+!.python-version
 !__init__.py
