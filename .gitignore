@@ -2,6 +2,7 @@
 __*__
 data/
 *.md
+!Отчет по рубежному контролю.md
 !README.md
 !.gitignore
 !.python-version
