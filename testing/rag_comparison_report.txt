@@ -1,0 +1,71 @@
+================================================================================
+RAG SYSTEM COMPARISON REPORT
+================================================================================
+
+Date: 2025-12-12 16:13:21.788623
+
+SYSTEMS COMPARED:
+
+1. Baseline RAG:
+   - Simple chunking (1000 tokens)
+   - Embeddings: nomic-embed-text:v1.5
+   - Search: vector only
+   - No VLM, no reranking, no query expansion
+
+2. Full RAG:
+   - Smart chunking with VLM analysis
+   - Table parsing
+   - Hybrid search (vector + BM25)
+   - Query expansion: True
+   - Reranker: True
+
+DATASET:
+  Documents: 100
+  Queries: 886
+    - Text: 758
+    - Image: 128
+
+OVERALL RESULTS:
+              Baseline RAG  Full RAG  Improvement (%)
+recall@5            0.4763    0.8747            83.65
+recall@10           0.5621    0.8939            59.04
+precision@5         0.1330    0.4165           213.24
+precision@10        0.0911    0.2808           208.30
+mrr                 0.3789    0.7875           107.83
+ndcg@5              0.4911    1.4190           188.95
+ndcg@10             0.5707    1.6542           189.87
+
+TEXT QUERIES:
+              Baseline  Full RAG  Improv (%)
+recall@5        0.5290    0.9129       72.57
+recall@10       0.6227    0.9248       48.52
+precision@5     0.1470    0.4364      196.95
+precision@10    0.1011    0.2934      190.34
+mrr             0.4222    0.8281       96.15
+ndcg@5          0.5450    1.4920      173.76
+ndcg@10         0.6342    1.7355      173.64
+
+IMAGE QUERIES:
+              Baseline  Full RAG  Improv (%)
+recall@5        0.1641    0.6484      295.24
+recall@10       0.2031    0.7109      250.00
+precision@5     0.0500    0.2984      496.87
+precision@10    0.0320    0.2062      543.89
+mrr             0.1227    0.5470      345.86
+ndcg@5          0.1717    0.9867      474.57
+ndcg@10         0.1943    1.1727      503.57
+
+KEY FINDINGS:
+  - Best Full RAG metric: ndcg@10 = 1.6542
+  - Largest improvement: precision@5 = +213.24%
+  - Average improvement: 150.13%
+
+INTERPRETATION:
+  Recall@5 > 0.7  = Good (correct page in top-5 most of the time)
+  MRR > 0.5       = Good (correct page typically in top-2)
+
+CONCLUSION:
+  Full RAG system shows significant improvement
+  over simple baseline, justifying the additional complexity.
+
+================================================================================

@@ -7,3 +7,5 @@ data/
 !.gitignore
 !.python-version
 !__init__.py
+testing/baseline*
+testing/rag_engine

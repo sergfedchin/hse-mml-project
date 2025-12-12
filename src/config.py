@@ -87,18 +87,13 @@ class Config:
         self.ollama_timeout = ollama.get("timeout", 180.0)
 
         # ====================================================================
-        # Векторная БД
+        # Хранилище
         # ====================================================================
-        vector_db = config_dict.get("vector_db", {})
-        self.vector_db_path = vector_db.get("path", "./data/rag_engine/chromadb")
-
-        # ====================================================================
-        # Хранилище изображений
-        # ====================================================================
-        storage = config_dict.get("storage", {})
-        self.images_storage_path = storage.get(
-            "images_path", "./data/rag_engine/images/"
+        storage_path = Path(
+            config_dict.get("storage", {}).get("storage_path", "./data/rag_engine")
         )
+        self.images_storage_path = str(storage_path / "images")
+        self.vector_db_path = str(storage_path / "chromadb")
 
         # ====================================================================
         # Параметры chunking
